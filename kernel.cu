@@ -9,9 +9,37 @@
 
 #define DTYPE int
 // Add any additional #include headers or helper macros needed
+#define NUM_STREAMS 4
+#define COMPARATOR_WIDTH 3
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
-__global__ void bitonicSort(DTYPE* arr) {}
+
+__global__ void bitonicSortInitialShared(DTYPE* arr) {}
+
+__global__ void bitonicSortShared(DTYPE* arr) {}
+
+__global__ void bitonicSortGlobal(DTYPE* arr) {}
+
+void performBitonicSort(DTYPE* arrGpu, std::vector<cudaStream_t>& streams,
+                        int N, int logN) {
+  // TODO: bitonicSort<<<grid, block>>>(arrGpu);
+
+  int i = 1;
+
+  // Invoke bitonicSortInitialShared and increment i appropriately
+
+  while (i <= logN) {
+    int j = i - 1;
+    while (j >= 0) {
+      // Figure out whether to call bitonicSortGlobal or bitonicSortShared
+      // If bitonicSortGlobal, decrement j by (at most) COMPARATOR_WIDTH
+      // If bitonicSortShared, break
+
+      // j--;
+    }
+    i++;
+  }
+}
 
 /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
 int main(int argc, char* argv[]) {
@@ -39,15 +67,35 @@ int main(int argc, char* argv[]) {
   cudaEventRecord(start);
   /* ==== DO NOT MODIFY CODE ABOVE THIS LINE ==== */
 
+  std::vector<cudaStream_t> streams(NUM_STREAMS);
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaStreamCreate(&streams[i]);
+  }
+
   // arCpu contains the input random array
   // arrSortedGpu should contain the sorted array copied from GPU to CPU
   DTYPE* arrSortedGpu = (DTYPE*)malloc(size * sizeof(DTYPE));
 
   DTYPE* arrGpu;
-  cudaMalloc((void**)&arrGpu, size * sizeof(DTYPE));
 
-  // Transfer data (arr_cpu) to device
-  cudaMemcpy(arrGpu, arrCpu, size * sizeof(DTYPE), cudaMemcpyHostToDevice);
+  int N = 1;
+  int logN = 0;
+  while (N < size) {
+    N <<= 1;
+    logN++;
+  }
+  cudaMalloc((void**)&arrGpu, N * sizeof(DTYPE));
+  cudaMemsetD32Async(arrGpu + size, INT_MAX, N - size, 0);
+
+  // Transfer data (arrCpu) to device
+  int chunkSize = N / NUM_STREAMS;
+  int copied = 0;
+  for (int i = 0; i < NUM_STREAMS && copied < size; i++) {
+    int copySize = std::min(chunkSize, size - copied);
+    cudaMemcpyAsync(arrGpu + copied, arrCpu + copied, copySize * sizeof(DTYPE),
+                    cudaMemcpyHostToDevice, streams[i]);
+    copied += chunkSize;
+  }
 
   /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
   cudaEventRecord(stop);
@@ -59,7 +107,7 @@ int main(int argc, char* argv[]) {
   /* ==== DO NOT MODIFY CODE ABOVE THIS LINE ==== */
 
   // Perform bitonic sort on GPU
-  // TODO: bitonicSort<<<grid, block>>>(arrGpu);
+  performBitonicSort(arrGpu, streams, N, logN);
 
   /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
   cudaEventRecord(stop);
@@ -71,8 +119,19 @@ int main(int argc, char* argv[]) {
   /* ==== DO NOT MODIFY CODE ABOVE THIS LINE ==== */
 
   // Transfer sorted data back to host (copied to arrSortedGpu)
-  cudaMemcpy(arrSortedGpu, arrGpu, size * sizeof(DTYPE),
-             cudaMemcpyDeviceToHost);
+  copied = 0;
+  for (int i = 0; i < NUM_STREAMS && copied < size; i++) {
+    int copySize = std::min(chunkSize, size - copied);
+    cudaMemcpyAsync(arrSortedGpu + copied, arrGpu + copied,
+                    copySize * sizeof(DTYPE), cudaMemcpyDeviceToHost,
+                    streams[i]);
+    copied += chunkSize;
+  }
+
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaStreamDestroy(&streams[i]);
+  }
+
   cudaFree(arrGpu);
 
   /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
