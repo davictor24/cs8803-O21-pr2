@@ -9,6 +9,8 @@
 
 #define DTYPE int
 // Add any additional #include headers or helper macros needed
+#include <vector>
+
 #define NUM_STREAMS 1
 #define COMPARATOR_WIDTH 4
 #define BLOCK_SIZE 1024
@@ -16,6 +18,14 @@
 #define SHARED_SIZE (BLOCK_SIZE * PADDED_WIDTH)
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
+
+// Helper kernel for padding
+__global__ void setValues(int* arr, int value, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    arr[idx] = value;
+  }
+}
 
 // Branchless compare-exchange
 __device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
@@ -206,6 +216,11 @@ int main(int argc, char* argv[]) {
     cudaStreamCreate(&streams[i]);
   }
 
+  cudaStream_t paddingStream;
+  cudaStreamCreate(&paddingStream);
+  cudaEvent_t paddingCompleteEvent;
+  cudaEventCreate(&paddingCompleteEvent);
+
   // arCpu contains the input random array
   // arrSortedGpu should contain the sorted array copied from GPU to CPU
   DTYPE* arrSortedGpu = (DTYPE*)malloc(size * sizeof(DTYPE));
@@ -217,7 +232,15 @@ int main(int argc, char* argv[]) {
     N <<= 1;
   }
   cudaMalloc((void**)&arrGpu, N * sizeof(DTYPE));
-  cudaMemsetD32Async(arrGpu + size, INT_MAX, N - size, 0);
+
+  if (N > size) {
+    int elementsToSet = N - size;
+    int blockSize = 256;
+    int numGrids = (elementsToSet + blockSize - 1) / blockSize;
+    setValues<<<numGrids, blockSize, 0, paddingStream>>>(arrGpu + size, INT_MAX,
+                                                         elementsToSet);
+    cudaEventRecord(paddingCompleteEvent, paddingStream);
+  }
 
   // Transfer data (arrCpu) to device
   int chunkSize = N / NUM_STREAMS;
@@ -227,6 +250,12 @@ int main(int argc, char* argv[]) {
     cudaMemcpyAsync(arrGpu + copied, arrCpu + copied, copySize * sizeof(DTYPE),
                     cudaMemcpyHostToDevice, streams[i]);
     copied += chunkSize;
+  }
+
+  if (N > size) {
+    for (int i = 0; i < NUM_STREAMS; i++) {
+      cudaStreamWaitEvent(streams[i], paddingCompleteEvent, 0);
+    }
   }
 
   /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
@@ -263,8 +292,10 @@ int main(int argc, char* argv[]) {
   }
 
   for (int i = 0; i < NUM_STREAMS; i++) {
-    cudaStreamDestroy(&streams[i]);
+    cudaStreamDestroy(streams[i]);
   }
+  cudaStreamDestroy(paddingStream);
+  cudaEventDestroy(paddingCompleteEvent);
 
   // Not a requirement for the project
   // (https://edstem.org/us/courses/81715/discussion/6897777?comment=16332533)
