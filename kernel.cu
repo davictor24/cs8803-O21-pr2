@@ -189,6 +189,8 @@ int main(int argc, char* argv[]) {
   cudaEventRecord(start);
   /* ==== DO NOT MODIFY CODE ABOVE THIS LINE ==== */
 
+  cudaHostRegister(arrCpu, size * sizeof(DTYPE), cudaHostRegisterDefault);
+
   std::vector<cudaStream_t> streams(NUM_STREAMS);
   for (int i = 0; i < NUM_STREAMS; i++) {
     cudaStreamCreate(&streams[i]);
@@ -231,6 +233,8 @@ int main(int argc, char* argv[]) {
   // Perform bitonic sort on GPU
   performBitonicSort(arrGpu, streams, N, logN);
 
+  cudaHostRegister(arrSortedGpu, size * sizeof(DTYPE), cudaHostRegisterDefault);
+
   /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
@@ -253,6 +257,11 @@ int main(int argc, char* argv[]) {
   for (int i = 0; i < NUM_STREAMS; i++) {
     cudaStreamDestroy(&streams[i]);
   }
+
+  // Not a requirement for the project
+  // (https://edstem.org/us/courses/81715/discussion/6897777?comment=16332533)
+  // cudaHostUnregister(arrCpu);
+  // cudaHostUnregister(arrSortedGpu);
 
   cudaFree(arrGpu);
 
