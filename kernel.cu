@@ -74,8 +74,8 @@ __device__ void compareExchangeBlock(DTYPE* a, DTYPE* b, bool ascending) {
 __global__ void bitonicSortInitialShared(DTYPE* arr) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
-  int tid = threadIdx.x;
-  int sharedIdx = tid * COMPARATOR_WIDTH;
+  int k = threadIdx.x;
+  int sharedIdx = k * COMPARATOR_WIDTH;
   int globalIdx = blockIdx.x * SHARED_SIZE + sharedIdx;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
@@ -86,9 +86,9 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
 
   for (int i = 1; i <= __builtin_ctz(BLOCK_SIZE); i++) {
     for (int j = i - 1; j >= 0; j--) {
-      int partner = tid ^ (1 << j);
-      if (partner > tid) {
-        bool ascending = ((tid & (1 << i)) == 0);
+      int partner = k ^ (1 << j);
+      if (partner > k) {
+        bool ascending = ((k & (1 << i)) == 0);
         compareExchangeBlock(&shared[sharedIdx],
                              &shared[partner * COMPARATOR_WIDTH], ascending);
       }
@@ -105,8 +105,8 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
 __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
-  int tid = threadIdx.x;
-  int sharedIdx = tid * COMPARATOR_WIDTH;
+  int k = threadIdx.x;
+  int sharedIdx = k * COMPARATOR_WIDTH;
   int globalIdx = blockIdx.x * SHARED_SIZE + sharedIdx;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
@@ -116,9 +116,9 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   __syncthreads();
 
   for (int j = __builtin_ctz(BLOCK_SIZE) - 1; j >= 0; j--) {
-    int partner = tid ^ (1 << j);
-    if (partner > tid) {
-      bool ascending = ((tid & (1 << stage)) == 0);
+    int partner = k ^ (1 << j);
+    if (partner > k) {
+      bool ascending = ((k & (1 << stage)) == 0);
       compareExchangeBlock(&shared[sharedIdx],
                            &shared[partner * COMPARATOR_WIDTH], ascending);
     }
@@ -131,7 +131,16 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   }
 }
 
-__global__ void bitonicSortGlobal(DTYPE* arr) {}
+__global__ void bitonicSortGlobal(DTYPE* arr, int stage, int step) {
+  int k = threadIdx.x + blockIdx.x * blockDim.x;
+  int partner = k ^ (1 << step);
+
+  if (partner > k) {
+    bool ascending = ((k & (1 << stage)) == 0);
+    compareExchangeBlock(&arr[k * COMPARATOR_WIDTH],
+                         &arr[partner * COMPARATOR_WIDTH], ascending);
+  }
+}
 
 void performBitonicSort(DTYPE* arrGpu, std::vector<cudaStream_t>& streams,
                         int N, int logN) {
