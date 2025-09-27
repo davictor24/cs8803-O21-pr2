@@ -11,7 +11,7 @@
 // Add any additional #include headers or helper macros needed
 #include <vector>
 
-#define NUM_STREAMS 1
+#define NUM_STREAMS 16
 #define BLOCK_SIZE 256
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
@@ -23,11 +23,11 @@ __device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
   b = ascending ? max : min;
 }
 
-__global__ void bitonicSortInitialShared(DTYPE* arr) {
+__global__ void bitonicSortInitialShared(DTYPE* arr, int blockOffset) {
   __shared__ DTYPE shared[BLOCK_SIZE];
   __shared__ DTYPE dummy[2];
 
-  const int globalIdx = threadIdx.x + blockIdx.x * BLOCK_SIZE;
+  const int globalIdx = threadIdx.x + (blockIdx.x + blockOffset) * BLOCK_SIZE;
   shared[threadIdx.x] = arr[globalIdx];
 
   __syncthreads();
@@ -48,10 +48,10 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
   arr[globalIdx] = shared[threadIdx.x];
 }
 
-__global__ void bitonicSortShared(DTYPE* arr, int stage) {
+__global__ void bitonicSortShared(DTYPE* arr, int stage, int blockOffset) {
   __shared__ DTYPE shared[BLOCK_SIZE];
 
-  const int globalIdx = threadIdx.x + blockIdx.x * BLOCK_SIZE;
+  const int globalIdx = threadIdx.x + (blockIdx.x + blockOffset) * BLOCK_SIZE;
   shared[threadIdx.x] = arr[globalIdx];
 
   __syncthreads();
@@ -69,8 +69,9 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   arr[globalIdx] = shared[threadIdx.x];
 }
 
-__global__ void bitonicSortGlobal(DTYPE* arr, int stage, int step) {
-  const int globalIdx = threadIdx.x + blockIdx.x * BLOCK_SIZE;
+__global__ void bitonicSortGlobal(DTYPE* arr, int stage, int step,
+                                  int blockOffset) {
+  const int globalIdx = threadIdx.x + (blockIdx.x + blockOffset) * BLOCK_SIZE;
   const int partner = globalIdx ^ (1 << step);
 
   if (partner > globalIdx) {
@@ -81,24 +82,65 @@ __global__ void bitonicSortGlobal(DTYPE* arr, int stage, int step) {
 
 void performBitonicSort(DTYPE* arrGpu, std::vector<cudaStream_t>& streams,
                         int N) {
-  // TODO: Support multiple streams
-  cudaStream_t stream = streams[0];
-
   const int logN = __builtin_ctz(N);
-  const int logBlockN = __builtin_ctz(BLOCK_SIZE);
-  const int numGrids = N / BLOCK_SIZE;
+  const int logBlockSize = __builtin_ctz(BLOCK_SIZE);
+  const int logNumStreams = __builtin_ctz(NUM_STREAMS);
 
-  bitonicSortInitialShared<<<numGrids, BLOCK_SIZE, 0, stream>>>(arrGpu);
+  const int totalNumGrids = N / BLOCK_SIZE;
+  const int numGridsPerStream = totalNumGrids / NUM_STREAMS;
 
-  for (int i = logBlockN + 1; i <= logN; i++) {
+  std::vector<cudaEvent_t> events(NUM_STREAMS);
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaEventCreate(&events[i]);
+  }
+
+  for (int s = 0; s < NUM_STREAMS; s++) {
+    int blockOffset = s * numGridsPerStream;
+    bitonicSortInitialShared<<<numGridsPerStream, BLOCK_SIZE, 0, streams[s]>>>(
+        arrGpu, blockOffset);
+  }
+
+  for (int i = logBlockSize + 1; i <= logN; i++) {
     for (int j = i - 1; j >= 0; j--) {
-      if (j >= logBlockN) {
-        bitonicSortGlobal<<<numGrids, BLOCK_SIZE, 0, stream>>>(arrGpu, i, j);
+      bool crossStream = (j >= logN - logNumStreams);
+
+      if (crossStream) {
+        for (int s = 0; s < NUM_STREAMS; s++) {
+          cudaEventRecord(events[s], streams[s]);
+        }
+        for (int s = 0; s < NUM_STREAMS; s++) {
+          cudaStreamWaitEvent(streams[0], events[s], 0);
+        }
+
+        bitonicSortGlobal<<<totalNumGrids, BLOCK_SIZE, 0, streams[0]>>>(
+            arrGpu, i, j, 0);
+
+        cudaEventRecord(events[0], streams[0]);
+        for (int s = 1; s < NUM_STREAMS; s++) {
+          cudaStreamWaitEvent(streams[s], events[0], 0);
+        }
       } else {
-        bitonicSortShared<<<numGrids, BLOCK_SIZE, 0, stream>>>(arrGpu, i);
-        break;
+        if (j >= logBlockSize) {
+          for (int s = 0; s < NUM_STREAMS; s++) {
+            int blockOffset = s * numGridsPerStream;
+            bitonicSortGlobal<<<numGridsPerStream, BLOCK_SIZE, 0, streams[s]>>>(
+                arrGpu, i, j, blockOffset);
+          }
+        } else {
+          for (int s = 0; s < NUM_STREAMS; s++) {
+            int blockOffset = s * numGridsPerStream;
+            bitonicSortShared<<<numGridsPerStream, BLOCK_SIZE, 0, streams[s]>>>(
+                arrGpu, i, blockOffset);
+          }
+          goto next_stage;
+        }
       }
     }
+  next_stage:;
+  }
+
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaEventDestroy(events[i]);
   }
 }
 
@@ -128,8 +170,6 @@ int main(int argc, char* argv[]) {
   cudaEventRecord(start);
   /* ==== DO NOT MODIFY CODE ABOVE THIS LINE ==== */
 
-  cudaHostRegister(arrCpu, size * sizeof(DTYPE), cudaHostRegisterDefault);
-
   std::vector<cudaStream_t> streams(NUM_STREAMS);
   for (int i = 0; i < NUM_STREAMS; i++) {
     cudaStreamCreate(&streams[i]);
@@ -140,12 +180,7 @@ int main(int argc, char* argv[]) {
   cudaEvent_t paddingCompleteEvent;
   cudaEventCreate(&paddingCompleteEvent);
 
-  // arCpu contains the input random array
-  // arrSortedGpu should contain the sorted array copied from GPU to CPU
-  DTYPE* arrSortedGpu = (DTYPE*)malloc(size * sizeof(DTYPE));
-
   DTYPE* arrGpu;
-
   int N = BLOCK_SIZE;
   while (N < size) {
     N <<= 1;
@@ -164,6 +199,8 @@ int main(int argc, char* argv[]) {
   int copied = 0;
   for (int i = 0; i < NUM_STREAMS && copied < size; i++) {
     const int copySize = std::min(chunkSize, size - copied);
+    cudaHostRegister(arrCpu + copied, copySize * sizeof(DTYPE),
+                     cudaHostRegisterDefault);
     cudaMemcpyAsync(arrGpu + copied, arrCpu + copied, copySize * sizeof(DTYPE),
                     cudaMemcpyHostToDevice, streams[i]);
     copied += copySize;
@@ -187,6 +224,7 @@ int main(int argc, char* argv[]) {
   // Perform bitonic sort on GPU
   performBitonicSort(arrGpu, streams, N);
 
+  DTYPE* arrSortedGpu = (DTYPE*)malloc(size * sizeof(DTYPE));
   cudaHostRegister(arrSortedGpu, size * sizeof(DTYPE), cudaHostRegisterDefault);
 
   /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
@@ -221,7 +259,7 @@ int main(int argc, char* argv[]) {
   // cudaHostUnregister(arrCpu);
   // cudaHostUnregister(arrSortedGpu);
 
-  cudaFree(arrGpu);
+  cudaFreeAsync(arrGpu, 0);
 
   /* ==== DO NOT MODIFY CODE BELOW THIS LINE ==== */
   cudaEventRecord(stop);
