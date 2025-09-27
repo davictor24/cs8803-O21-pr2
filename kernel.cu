@@ -102,7 +102,34 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
   }
 }
 
-__global__ void bitonicSortShared(DTYPE* arr) {}
+__global__ void bitonicSortShared(DTYPE* arr, int stage) {
+  __shared__ DTYPE shared[SHARED_SIZE];
+
+  int tid = threadIdx.x;
+  int sharedIdx = tid * COMPARATOR_WIDTH;
+  int globalIdx = blockIdx.x * SHARED_SIZE + sharedIdx;
+
+  for (int i = 0; i < COMPARATOR_WIDTH; i++) {
+    shared[sharedIdx + i] = arr[globalIdx + i];
+  }
+
+  __syncthreads();
+
+  for (int j = __builtin_ctz(BLOCK_SIZE) - 1; j >= 0; j--) {
+    int partner = tid ^ (1 << j);
+    if (partner > tid) {
+      bool ascending = ((tid & (1 << stage)) == 0);
+      compareExchangeBlock(&shared[sharedIdx],
+                           &shared[partner * COMPARATOR_WIDTH], ascending);
+    }
+
+    __syncthreads();
+  }
+
+  for (int i = 0; i < COMPARATOR_WIDTH; i++) {
+    arr[globalIdx + i] = shared[sharedIdx + i];
+  }
+}
 
 __global__ void bitonicSortGlobal(DTYPE* arr) {}
 
