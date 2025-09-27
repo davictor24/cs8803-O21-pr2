@@ -12,7 +12,8 @@
 #define NUM_STREAMS 4
 #define COMPARATOR_WIDTH 4
 #define BLOCK_SIZE 1024
-#define SHARED_SIZE (BLOCK_SIZE * COMPARATOR_WIDTH)
+#define PADDED_WIDTH (COMPARATOR_WIDTH + 1)
+#define SHARED_SIZE (BLOCK_SIZE * PADDED_WIDTH)
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
 
@@ -75,8 +76,9 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
   int k = threadIdx.x;
-  int sharedIdx = k * COMPARATOR_WIDTH;
-  int globalIdx = blockIdx.x * SHARED_SIZE + sharedIdx;
+  int sharedIdx = k * PADDED_WIDTH;
+  int globalIdx =
+      blockIdx.x * BLOCK_SIZE * COMPARATOR_WIDTH + k * COMPARATOR_WIDTH;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
     shared[sharedIdx + i] = arr[globalIdx + i];
@@ -90,7 +92,7 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
       if (partner > k) {
         bool ascending = ((k & (1 << i)) == 0);
         compareExchangeBlock(&shared[sharedIdx],
-                             &shared[partner * COMPARATOR_WIDTH], ascending);
+                             &shared[partner * PADDED_WIDTH], ascending);
       }
 
       __syncthreads();
@@ -106,8 +108,9 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
   int k = threadIdx.x;
-  int sharedIdx = k * COMPARATOR_WIDTH;
-  int globalIdx = blockIdx.x * SHARED_SIZE + sharedIdx;
+  int sharedIdx = k * PADDED_WIDTH;
+  int globalIdx =
+      blockIdx.x * BLOCK_SIZE * COMPARATOR_WIDTH + k * COMPARATOR_WIDTH;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
     shared[sharedIdx + i] = arr[globalIdx + i];
@@ -119,8 +122,8 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
     int partner = k ^ (1 << j);
     if (partner > k) {
       bool ascending = ((k & (1 << stage)) == 0);
-      compareExchangeBlock(&shared[sharedIdx],
-                           &shared[partner * COMPARATOR_WIDTH], ascending);
+      compareExchangeBlock(&shared[sharedIdx], &shared[partner * PADDED_WIDTH],
+                           ascending);
     }
 
     __syncthreads();
