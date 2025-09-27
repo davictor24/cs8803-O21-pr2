@@ -10,11 +10,97 @@
 #define DTYPE int
 // Add any additional #include headers or helper macros needed
 #define NUM_STREAMS 4
-#define COMPARATOR_WIDTH 3
+#define COMPARATOR_WIDTH 4
+#define BLOCK_SIZE 1024
+#define SHARED_SIZE (BLOCK_SIZE * COMPARATOR_WIDTH)
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
 
-__global__ void bitonicSortInitialShared(DTYPE* arr) {}
+// Branchless compare-exchange
+__device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
+  DTYPE lessMask = -((a - b) < 0);
+  DTYPE min = (lessMask & a) | (~lessMask & b);
+  DTYPE max = (lessMask & b) | (~lessMask & a);
+
+  DTYPE ascMask = -(ascending);
+  a = (ascMask & min) | (~ascMask & max);
+  b = (ascMask & max) | (~ascMask & min);
+}
+
+// Hand-coded bitonic sorting network for 2 elements
+__device__ void bitonicSortingNetwork2(DTYPE* a, DTYPE* b, bool ascending) {
+  compareExchange(a[0], b[0], ascending);
+}
+
+// Hand-coded bitonic sorting network for 4 elements
+__device__ void bitonicSortingNetwork4(DTYPE* a, DTYPE* b, bool ascending) {
+  bitonicSortingNetwork2(&a[0], &a[1], ascending);
+  bitonicSortingNetwork2(&b[0], &b[1], !ascending);
+
+  compareExchange(a[0], b[0], ascending);
+  compareExchange(a[1], b[1], ascending);
+
+  bitonicSortingNetwork2(&a[0], &a[1], ascending);
+  bitonicSortingNetwork2(&b[0], &b[1], ascending);
+}
+
+// Hand-coded bitonic sorting network for 8 elements
+__device__ void bitonicSortingNetwork8(DTYPE* a, DTYPE* b, bool ascending) {
+  bitonicSortingNetwork4(&a[0], &a[2], ascending);
+  bitonicSortingNetwork4(&b[0], &b[2], !ascending);
+
+  compareExchange(a[0], b[0], ascending);
+  compareExchange(a[1], b[1], ascending);
+  compareExchange(a[2], b[2], ascending);
+  compareExchange(a[3], b[3], ascending);
+
+  bitonicSortingNetwork4(&a[0], &a[2], ascending);
+  bitonicSortingNetwork4(&b[0], &b[2], ascending);
+}
+
+// Compare-exchange for COMPARATOR_WIDTH elements
+__device__ void compareExchangeBlock(DTYPE* a, DTYPE* b, bool ascending) {
+#if COMPARATOR_WIDTH == 1
+  bitonicSortingNetwork2(a, b, ascending);
+#elif COMPARATOR_WIDTH == 2
+  bitonicSortingNetwork4(a, b, ascending);
+#elif COMPARATOR_WIDTH == 4
+  bitonicSortingNetwork8(a, b, ascending);
+#else
+#error "Provided COMPARATOR_WIDTH not supported."
+#endif
+}
+
+__global__ void bitonicSortInitialShared(DTYPE* arr) {
+  __shared__ DTYPE shared[SHARED_SIZE];
+
+  int tid = threadIdx.x;
+  int sharedIdx = tid * COMPARATOR_WIDTH;
+  int globalIdx = blockIdx.x * SHARED_SIZE + sharedIdx;
+
+  for (int i = 0; i < COMPARATOR_WIDTH; i++) {
+    shared[sharedIdx + i] = arr[globalIdx + i];
+  }
+
+  __syncthreads();
+
+  for (int i = 1; i <= __builtin_ctz(BLOCK_SIZE); i++) {
+    for (int j = i - 1; j >= 0; j--) {
+      int partner = tid ^ (1 << j);
+      if (partner > tid) {
+        bool ascending = ((tid & (1 << i)) == 0);
+        compareExchangeBlock(&shared[sharedIdx],
+                             &shared[partner * COMPARATOR_WIDTH], ascending);
+      }
+
+      __syncthreads();
+    }
+  }
+
+  for (int i = 0; i < COMPARATOR_WIDTH; i++) {
+    arr[globalIdx + i] = shared[sharedIdx + i];
+  }
+}
 
 __global__ void bitonicSortShared(DTYPE* arr) {}
 
@@ -32,7 +118,7 @@ void performBitonicSort(DTYPE* arrGpu, std::vector<cudaStream_t>& streams,
     int j = i - 1;
     while (j >= 0) {
       // Figure out whether to call bitonicSortGlobal or bitonicSortShared
-      // If bitonicSortGlobal, decrement j by (at most) COMPARATOR_WIDTH
+      // If bitonicSortGlobal, decrement j by (at most) log(COMPARATOR_WIDTH)
       // If bitonicSortShared, break
 
       // j--;
