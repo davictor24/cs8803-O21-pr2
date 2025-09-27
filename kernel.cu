@@ -14,7 +14,7 @@
 #define NUM_STREAMS 1
 #define COMPARATOR_WIDTH 4
 #define BLOCK_SIZE 1024
-#define PADDED_WIDTH (COMPARATOR_WIDTH + 1)
+#define PADDED_WIDTH (COMPARATOR_WIDTH + (COMPARATOR_WIDTH > 1))
 #define SHARED_SIZE (BLOCK_SIZE * PADDED_WIDTH)
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
@@ -85,10 +85,10 @@ __device__ void compareExchangeBlock(DTYPE* a, DTYPE* b, bool ascending) {
 __global__ void bitonicSortInitialShared(DTYPE* arr) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
-  const int k = threadIdx.x;
-  const int sharedIdx = k * PADDED_WIDTH;
-  const int globalIdx =
-      blockIdx.x * BLOCK_SIZE * COMPARATOR_WIDTH + k * COMPARATOR_WIDTH;
+  const int sharedK = threadIdx.x;
+  const int sharedIdx = sharedK * PADDED_WIDTH;
+  const int globalK = threadIdx.x + blockIdx.x * BLOCK_SIZE;
+  const int globalIdx = globalK * COMPARATOR_WIDTH;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
     shared[sharedIdx + i] = arr[globalIdx + i];
@@ -98,9 +98,9 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
 
   for (int i = 1; i <= __builtin_ctz(BLOCK_SIZE); i++) {
     for (int j = i - 1; j >= 0; j--) {
-      const int partner = k ^ (1 << j);
-      if (partner > k) {
-        const bool ascending = ((k & (1 << i)) == 0);
+      const int partner = sharedK ^ (1 << j);
+      if (partner > sharedK) {
+        const bool ascending = ((globalK & (1 << i)) == 0);
         compareExchangeBlock(&shared[sharedIdx],
                              &shared[partner * PADDED_WIDTH], ascending);
       }
@@ -117,10 +117,10 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
 __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
-  const int k = threadIdx.x;
-  const int sharedIdx = k * PADDED_WIDTH;
-  const int globalIdx =
-      blockIdx.x * BLOCK_SIZE * COMPARATOR_WIDTH + k * COMPARATOR_WIDTH;
+  const int sharedK = threadIdx.x;
+  const int sharedIdx = sharedK * PADDED_WIDTH;
+  const int globalK = threadIdx.x + blockIdx.x * BLOCK_SIZE;
+  const int globalIdx = globalK * COMPARATOR_WIDTH;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
     shared[sharedIdx + i] = arr[globalIdx + i];
@@ -129,9 +129,9 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   __syncthreads();
 
   for (int j = __builtin_ctz(BLOCK_SIZE) - 1; j >= 0; j--) {
-    const int partner = k ^ (1 << j);
-    if (partner > k) {
-      const bool ascending = ((k & (1 << stage)) == 0);
+    const int partner = sharedK ^ (1 << j);
+    if (partner > sharedK) {
+      const bool ascending = ((globalK & (1 << stage)) == 0);
       compareExchangeBlock(&shared[sharedIdx], &shared[partner * PADDED_WIDTH],
                            ascending);
     }
@@ -145,12 +145,12 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
 }
 
 __global__ void bitonicSortGlobal(DTYPE* arr, int stage, int step) {
-  const int k = threadIdx.x + blockIdx.x * blockDim.x;
-  const int partner = k ^ (1 << step);
+  const int globalK = threadIdx.x + blockIdx.x * BLOCK_SIZE;
+  const int partner = globalK ^ (1 << step);
 
-  if (partner > k) {
-    const bool ascending = ((k & (1 << stage)) == 0);
-    compareExchangeBlock(&arr[k * COMPARATOR_WIDTH],
+  if (partner > globalK) {
+    const bool ascending = ((globalK & (1 << stage)) == 0);
+    compareExchangeBlock(&arr[globalK * COMPARATOR_WIDTH],
                          &arr[partner * COMPARATOR_WIDTH], ascending);
   }
 }
