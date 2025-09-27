@@ -9,7 +9,7 @@
 
 #define DTYPE int
 // Add any additional #include headers or helper macros needed
-#define NUM_STREAMS 4
+#define NUM_STREAMS 1
 #define COMPARATOR_WIDTH 4
 #define BLOCK_SIZE 1024
 #define PADDED_WIDTH (COMPARATOR_WIDTH + 1)
@@ -19,11 +19,11 @@
 
 // Branchless compare-exchange
 __device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
-  DTYPE lessMask = -((a - b) < 0);
-  DTYPE min = (lessMask & a) | (~lessMask & b);
-  DTYPE max = (lessMask & b) | (~lessMask & a);
+  const DTYPE lessMask = -((a - b) < 0);
+  const DTYPE min = (lessMask & a) | (~lessMask & b);
+  const DTYPE max = (lessMask & b) | (~lessMask & a);
 
-  DTYPE ascMask = -(ascending);
+  const DTYPE ascMask = -(ascending);
   a = (ascMask & min) | (~ascMask & max);
   b = (ascMask & max) | (~ascMask & min);
 }
@@ -75,9 +75,9 @@ __device__ void compareExchangeBlock(DTYPE* a, DTYPE* b, bool ascending) {
 __global__ void bitonicSortInitialShared(DTYPE* arr) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
-  int k = threadIdx.x;
-  int sharedIdx = k * PADDED_WIDTH;
-  int globalIdx =
+  const int k = threadIdx.x;
+  const int sharedIdx = k * PADDED_WIDTH;
+  const int globalIdx =
       blockIdx.x * BLOCK_SIZE * COMPARATOR_WIDTH + k * COMPARATOR_WIDTH;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
@@ -88,9 +88,9 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
 
   for (int i = 1; i <= __builtin_ctz(BLOCK_SIZE); i++) {
     for (int j = i - 1; j >= 0; j--) {
-      int partner = k ^ (1 << j);
+      const int partner = k ^ (1 << j);
       if (partner > k) {
-        bool ascending = ((k & (1 << i)) == 0);
+        const bool ascending = ((k & (1 << i)) == 0);
         compareExchangeBlock(&shared[sharedIdx],
                              &shared[partner * PADDED_WIDTH], ascending);
       }
@@ -107,9 +107,9 @@ __global__ void bitonicSortInitialShared(DTYPE* arr) {
 __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   __shared__ DTYPE shared[SHARED_SIZE];
 
-  int k = threadIdx.x;
-  int sharedIdx = k * PADDED_WIDTH;
-  int globalIdx =
+  const int k = threadIdx.x;
+  const int sharedIdx = k * PADDED_WIDTH;
+  const int globalIdx =
       blockIdx.x * BLOCK_SIZE * COMPARATOR_WIDTH + k * COMPARATOR_WIDTH;
 
   for (int i = 0; i < COMPARATOR_WIDTH; i++) {
@@ -119,9 +119,9 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
   __syncthreads();
 
   for (int j = __builtin_ctz(BLOCK_SIZE) - 1; j >= 0; j--) {
-    int partner = k ^ (1 << j);
+    const int partner = k ^ (1 << j);
     if (partner > k) {
-      bool ascending = ((k & (1 << stage)) == 0);
+      const bool ascending = ((k & (1 << stage)) == 0);
       compareExchangeBlock(&shared[sharedIdx], &shared[partner * PADDED_WIDTH],
                            ascending);
     }
@@ -135,34 +135,41 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage) {
 }
 
 __global__ void bitonicSortGlobal(DTYPE* arr, int stage, int step) {
-  int k = threadIdx.x + blockIdx.x * blockDim.x;
-  int partner = k ^ (1 << step);
+  const int k = threadIdx.x + blockIdx.x * blockDim.x;
+  const int partner = k ^ (1 << step);
 
   if (partner > k) {
-    bool ascending = ((k & (1 << stage)) == 0);
+    const bool ascending = ((k & (1 << stage)) == 0);
     compareExchangeBlock(&arr[k * COMPARATOR_WIDTH],
                          &arr[partner * COMPARATOR_WIDTH], ascending);
   }
 }
 
 void performBitonicSort(DTYPE* arrGpu, std::vector<cudaStream_t>& streams,
-                        int N, int logN) {
-  // TODO: bitonicSort<<<grid, block>>>(arrGpu);
+                        int N) {
+  // TODO: Support multiple streams
+  cudaStream_t stream = streams[0];
 
-  int i = 1;
+  // log2 of the number of "super-elements" (of COMPARATOR_WIDTH)
+  const int logSuperN = __builtin_ctz(N) - __builtin_ctz(COMPARATOR_WIDTH);
+  // log2 of the number of super-elements that fit in a block
+  const int logBlockSuperN = __builtin_ctz(BLOCK_SIZE);
+  // Total number of super-elements in the entire array
+  const int numSuperElements = N / COMPARATOR_WIDTH;
 
-  // Invoke bitonicSortInitialShared and increment i appropriately
+  const int numGrids = numSuperElements / BLOCK_SIZE;
 
-  while (i <= logN) {
-    int j = i - 1;
-    while (j >= 0) {
-      // Figure out whether to call bitonicSortGlobal or bitonicSortShared
-      // If bitonicSortGlobal, decrement j by (at most) log(COMPARATOR_WIDTH)
-      // If bitonicSortShared, break
+  bitonicSortInitialShared<<<numGrids, BLOCK_SIZE, 0, stream>>>(arrGpu);
 
-      // j--;
+  for (int i = logBlockSuperN + 1; i <= logSuperN; i++) {
+    for (int j = i - 1; j >= 0; j--) {
+      if (j >= logBlockSuperN) {
+        bitonicSortGlobal<<<numGrids, BLOCK_SIZE, 0, stream>>>(arrGpu, i, j);
+      } else {
+        bitonicSortShared<<<numGrids, BLOCK_SIZE, 0, stream>>>(arrGpu, i);
+        break;
+      }
     }
-    i++;
   }
 }
 
@@ -205,11 +212,9 @@ int main(int argc, char* argv[]) {
 
   DTYPE* arrGpu;
 
-  int N = 1;
-  int logN = 0;
+  int N = BLOCK_SIZE * COMPARATOR_WIDTH;
   while (N < size) {
     N <<= 1;
-    logN++;
   }
   cudaMalloc((void**)&arrGpu, N * sizeof(DTYPE));
   cudaMemsetD32Async(arrGpu + size, INT_MAX, N - size, 0);
@@ -234,7 +239,7 @@ int main(int argc, char* argv[]) {
   /* ==== DO NOT MODIFY CODE ABOVE THIS LINE ==== */
 
   // Perform bitonic sort on GPU
-  performBitonicSort(arrGpu, streams, N, logN);
+  performBitonicSort(arrGpu, streams, N);
 
   cudaHostRegister(arrSortedGpu, size * sizeof(DTYPE), cudaHostRegisterDefault);
 
