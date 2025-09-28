@@ -13,15 +13,15 @@
 
 #define NUM_STREAMS 8
 #define BLOCK_SIZE 1024
-#define GLOBAL_BLOCK_SIZE (BLOCK_SIZE >> 1)
+#define MAX_GLOBAL_STEPS 3
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
 
 __device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
-  const DTYPE min = (a < b) ? a : b;
-  const DTYPE max = (a >= b) ? a : b;
-  a = ascending ? min : max;
-  b = ascending ? max : min;
+  const DTYPE min_ = min(a, b);
+  const DTYPE max_ = max(a, b);
+  a = ascending ? min_ : max_;
+  b = ascending ? max_ : min_;
 }
 
 __global__ void bitonicSortInitialShared(DTYPE* __restrict__ arr,
@@ -75,22 +75,86 @@ __global__ void bitonicSortShared(DTYPE* __restrict__ arr, int stage,
 }
 
 __global__ void bitonicSortGlobal(DTYPE* __restrict__ arr, int stage, int step,
-                                  int blockOffset) {
-  const int stride = 1 << step;
-  const int pairIdx = threadIdx.x + (blockIdx.x + blockOffset) * blockDim.x;
-  const int group = pairIdx >> step;
-  const int offset = pairIdx & (stride - 1);
-  const int baseIdx = (group << (step + 1)) + offset;
-  const int partnerIdx = baseIdx + stride;
+                                  int blockOffset, int handleSteps) {
+  const int stride = 1 << (step - handleSteps + 1);
+  const int groupIdx = threadIdx.x + (blockIdx.x + blockOffset) * blockDim.x;
+  const int group = groupIdx >> (step - handleSteps + 1);
+  const int offset = groupIdx & (stride - 1);
+  const int idx0 = (group << (step + 1)) + offset;
+  const bool ascending = ((idx0 & (1 << stage)) == 0);
 
-  DTYPE selfValue = arr[baseIdx];
-  DTYPE partnerValue = arr[partnerIdx];
+  if (handleSteps == 3) {
+    const int idx1 = idx0 + stride;
+    const int idx2 = idx1 + stride;
+    const int idx3 = idx2 + stride;
+    const int idx4 = idx3 + stride;
+    const int idx5 = idx4 + stride;
+    const int idx6 = idx5 + stride;
+    const int idx7 = idx6 + stride;
 
-  const bool ascending = ((baseIdx & (1 << stage)) == 0);
-  compareExchange(selfValue, partnerValue, ascending);
+    DTYPE value0 = arr[idx0];
+    DTYPE value1 = arr[idx1];
+    DTYPE value2 = arr[idx2];
+    DTYPE value3 = arr[idx3];
+    DTYPE value4 = arr[idx4];
+    DTYPE value5 = arr[idx5];
+    DTYPE value6 = arr[idx6];
+    DTYPE value7 = arr[idx7];
 
-  arr[baseIdx] = selfValue;
-  arr[partnerIdx] = partnerValue;
+    compareExchange(value0, value4, ascending);
+    compareExchange(value1, value5, ascending);
+    compareExchange(value2, value6, ascending);
+    compareExchange(value3, value7, ascending);
+
+    compareExchange(value0, value2, ascending);
+    compareExchange(value1, value3, ascending);
+    compareExchange(value4, value6, ascending);
+    compareExchange(value5, value7, ascending);
+
+    compareExchange(value0, value1, ascending);
+    compareExchange(value2, value3, ascending);
+    compareExchange(value4, value5, ascending);
+    compareExchange(value6, value7, ascending);
+
+    arr[idx0] = value0;
+    arr[idx1] = value1;
+    arr[idx2] = value2;
+    arr[idx3] = value3;
+    arr[idx4] = value4;
+    arr[idx5] = value5;
+    arr[idx6] = value6;
+    arr[idx7] = value7;
+  } else if (handleSteps == 2) {
+    const int idx1 = idx0 + stride;
+    const int idx2 = idx1 + stride;
+    const int idx3 = idx2 + stride;
+
+    DTYPE value0 = arr[idx0];
+    DTYPE value1 = arr[idx1];
+    DTYPE value2 = arr[idx2];
+    DTYPE value3 = arr[idx3];
+
+    compareExchange(value0, value2, ascending);
+    compareExchange(value1, value3, ascending);
+
+    compareExchange(value0, value1, ascending);
+    compareExchange(value2, value3, ascending);
+
+    arr[idx0] = value0;
+    arr[idx1] = value1;
+    arr[idx2] = value2;
+    arr[idx3] = value3;
+  } else {
+    const int idx1 = idx0 + stride;
+
+    DTYPE value0 = arr[idx0];
+    DTYPE value1 = arr[idx1];
+
+    compareExchange(value0, value1, ascending);
+
+    arr[idx0] = value0;
+    arr[idx1] = value1;
+  }
 }
 
 void performBitonicSort(DTYPE* __restrict__ arrGpu,
@@ -104,8 +168,8 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
   const int numBlocksPerStream = totalNumBlocks / NUM_STREAMS;
 
   std::vector<cudaEvent_t> events(NUM_STREAMS);
-  for (int i = 0; i < NUM_STREAMS; i++) {
-    cudaEventCreate(&events[i]);
+  for (int s = 0; s < NUM_STREAMS; s++) {
+    cudaEventCreate(&events[s]);
   }
 
   for (int s = 0; s < NUM_STREAMS; s++) {
@@ -114,12 +178,16 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
         arrGpu, blockOffset);
   }
 
-  for (int i = logBlockSize + 1; i <= logN; i++) {
-    for (int j = i - 1; j >= 0; j--) {
-      bool crossStream = (j >= logStreamSize);
+  for (int stage = logBlockSize + 1; stage <= logN; stage++) {
+    int step = stage - 1;
+    while (step >= logBlockSize) {
+      int handleSteps = std::min(MAX_GLOBAL_STEPS, step - logBlockSize + 1);
+      int blockSize = BLOCK_SIZE >> handleSteps;
+
+      bool crossStream = (step >= logStreamSize);
 
       if (crossStream) {
-        const int streamsPerGroup = 1 << (j + 1 - logStreamSize);
+        const int streamsPerGroup = 1 << (step + 1 - logStreamSize);
         const int blocksPerGroup = streamsPerGroup * numBlocksPerStream;
         const int numGroups = NUM_STREAMS / streamsPerGroup;
 
@@ -138,8 +206,8 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
           }
 
           const int blockOffset = groupStart * numBlocksPerStream;
-          bitonicSortGlobal<<<blocksPerGroup, GLOBAL_BLOCK_SIZE, 0,
-                              leaderStream>>>(arrGpu, i, j, blockOffset);
+          bitonicSortGlobal<<<blocksPerGroup, blockSize, 0, leaderStream>>>(
+              arrGpu, stage, step, blockOffset, handleSteps);
 
           cudaEventRecord(events[groupStart], leaderStream);
           for (int s = 1; s < streamsPerGroup; s++) {
@@ -148,27 +216,25 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
           }
         }
       } else {
-        if (j >= logBlockSize) {
-          for (int s = 0; s < NUM_STREAMS; s++) {
-            int blockOffset = s * numBlocksPerStream;
-            bitonicSortGlobal<<<numBlocksPerStream, GLOBAL_BLOCK_SIZE, 0,
-                                streams[s]>>>(arrGpu, i, j, blockOffset);
-          }
-        } else {
-          for (int s = 0; s < NUM_STREAMS; s++) {
-            int blockOffset = s * numBlocksPerStream;
-            bitonicSortShared<<<numBlocksPerStream, BLOCK_SIZE, 0,
-                                streams[s]>>>(arrGpu, i, blockOffset);
-          }
-          goto next_stage;
+        for (int s = 0; s < NUM_STREAMS; s++) {
+          int blockOffset = s * numBlocksPerStream;
+          bitonicSortGlobal<<<numBlocksPerStream, blockSize, 0, streams[s]>>>(
+              arrGpu, stage, step, blockOffset, handleSteps);
         }
       }
+
+      step -= handleSteps;
     }
-  next_stage:;
+
+    for (int s = 0; s < NUM_STREAMS; s++) {
+      int blockOffset = s * numBlocksPerStream;
+      bitonicSortShared<<<numBlocksPerStream, BLOCK_SIZE, 0, streams[s]>>>(
+          arrGpu, stage, blockOffset);
+    }
   }
 
-  for (int i = 0; i < NUM_STREAMS; i++) {
-    cudaEventDestroy(events[i]);
+  for (int s = 0; s < NUM_STREAMS; s++) {
+    cudaEventDestroy(events[s]);
   }
 }
 
