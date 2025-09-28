@@ -11,8 +11,9 @@
 // Add any additional #include headers or helper macros needed
 #include <vector>
 
-#define NUM_STREAMS 16
-#define BLOCK_SIZE 256
+#define NUM_STREAMS 8
+#define BLOCK_SIZE 1024
+#define GLOBAL_BLOCK_SIZE (BLOCK_SIZE >> 1)
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
 
@@ -23,7 +24,8 @@ __device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
   b = ascending ? max : min;
 }
 
-__global__ void bitonicSortInitialShared(DTYPE* arr, int blockOffset) {
+__global__ void bitonicSortInitialShared(DTYPE* __restrict__ arr,
+                                         int blockOffset) {
   __shared__ DTYPE shared[BLOCK_SIZE];
   __shared__ DTYPE dummy[2];
 
@@ -48,8 +50,10 @@ __global__ void bitonicSortInitialShared(DTYPE* arr, int blockOffset) {
   arr[globalIdx] = shared[threadIdx.x];
 }
 
-__global__ void bitonicSortShared(DTYPE* arr, int stage, int blockOffset) {
+__global__ void bitonicSortShared(DTYPE* __restrict__ arr, int stage,
+                                  int blockOffset) {
   __shared__ DTYPE shared[BLOCK_SIZE];
+  __shared__ DTYPE dummy[2];
 
   const int globalIdx = threadIdx.x + (blockIdx.x + blockOffset) * BLOCK_SIZE;
   shared[threadIdx.x] = arr[globalIdx];
@@ -58,10 +62,11 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage, int blockOffset) {
 
   for (int j = __builtin_ctz(BLOCK_SIZE) - 1; j >= 0; j--) {
     const int partner = threadIdx.x ^ (1 << j);
-    if (partner > threadIdx.x) {
-      const bool ascending = ((globalIdx & (1 << stage)) == 0);
-      compareExchange(shared[threadIdx.x], shared[partner], ascending);
-    }
+    const bool isActive = partner > threadIdx.x;
+    DTYPE& a = isActive ? shared[threadIdx.x] : dummy[0];
+    DTYPE& b = isActive ? shared[partner] : dummy[1];
+    const bool ascending = ((globalIdx & (1 << stage)) == 0);
+    compareExchange(a, b, ascending);
 
     __syncthreads();
   }
@@ -69,25 +74,34 @@ __global__ void bitonicSortShared(DTYPE* arr, int stage, int blockOffset) {
   arr[globalIdx] = shared[threadIdx.x];
 }
 
-__global__ void bitonicSortGlobal(DTYPE* arr, int stage, int step,
+__global__ void bitonicSortGlobal(DTYPE* __restrict__ arr, int stage, int step,
                                   int blockOffset) {
-  const int globalIdx = threadIdx.x + (blockIdx.x + blockOffset) * BLOCK_SIZE;
-  const int partner = globalIdx ^ (1 << step);
+  const int stride = 1 << step;
+  const int pairIdx = threadIdx.x + (blockIdx.x + blockOffset) * blockDim.x;
+  const int group = pairIdx >> step;
+  const int offset = pairIdx & (stride - 1);
+  const int baseIdx = (group << (step + 1)) + offset;
+  const int partnerIdx = baseIdx + stride;
 
-  if (partner > globalIdx) {
-    const bool ascending = ((globalIdx & (1 << stage)) == 0);
-    compareExchange(arr[globalIdx], arr[partner], ascending);
-  }
+  DTYPE selfValue = arr[baseIdx];
+  DTYPE partnerValue = arr[partnerIdx];
+
+  const bool ascending = ((baseIdx & (1 << stage)) == 0);
+  compareExchange(selfValue, partnerValue, ascending);
+
+  arr[baseIdx] = selfValue;
+  arr[partnerIdx] = partnerValue;
 }
 
-void performBitonicSort(DTYPE* arrGpu, std::vector<cudaStream_t>& streams,
-                        int N) {
+void performBitonicSort(DTYPE* __restrict__ arrGpu,
+                        std::vector<cudaStream_t>& streams, int N) {
   const int logN = __builtin_ctz(N);
   const int logBlockSize = __builtin_ctz(BLOCK_SIZE);
   const int logNumStreams = __builtin_ctz(NUM_STREAMS);
+  const int logStreamSize = logN - logNumStreams;
 
-  const int totalNumGrids = N / BLOCK_SIZE;
-  const int numGridsPerStream = totalNumGrids / NUM_STREAMS;
+  const int totalNumBlocks = N / BLOCK_SIZE;
+  const int numBlocksPerStream = totalNumBlocks / NUM_STREAMS;
 
   std::vector<cudaEvent_t> events(NUM_STREAMS);
   for (int i = 0; i < NUM_STREAMS; i++) {
@@ -95,42 +109,56 @@ void performBitonicSort(DTYPE* arrGpu, std::vector<cudaStream_t>& streams,
   }
 
   for (int s = 0; s < NUM_STREAMS; s++) {
-    int blockOffset = s * numGridsPerStream;
-    bitonicSortInitialShared<<<numGridsPerStream, BLOCK_SIZE, 0, streams[s]>>>(
+    int blockOffset = s * numBlocksPerStream;
+    bitonicSortInitialShared<<<numBlocksPerStream, BLOCK_SIZE, 0, streams[s]>>>(
         arrGpu, blockOffset);
   }
 
   for (int i = logBlockSize + 1; i <= logN; i++) {
     for (int j = i - 1; j >= 0; j--) {
-      bool crossStream = (j >= logN - logNumStreams);
+      bool crossStream = (j >= logStreamSize);
 
       if (crossStream) {
-        for (int s = 0; s < NUM_STREAMS; s++) {
-          cudaEventRecord(events[s], streams[s]);
-        }
-        for (int s = 0; s < NUM_STREAMS; s++) {
-          cudaStreamWaitEvent(streams[0], events[s], 0);
-        }
+        const int streamsPerGroup = 1 << (j + 1 - logStreamSize);
+        const int blocksPerGroup = streamsPerGroup * numBlocksPerStream;
+        const int numGroups = NUM_STREAMS / streamsPerGroup;
 
-        bitonicSortGlobal<<<totalNumGrids, BLOCK_SIZE, 0, streams[0]>>>(
-            arrGpu, i, j, 0);
+        for (int g = 0; g < numGroups; g++) {
+          const int groupStart = g * streamsPerGroup;
+          cudaStream_t& leaderStream = streams[groupStart];
 
-        cudaEventRecord(events[0], streams[0]);
-        for (int s = 1; s < NUM_STREAMS; s++) {
-          cudaStreamWaitEvent(streams[s], events[0], 0);
+          for (int s = 0; s < streamsPerGroup; s++) {
+            const int streamIdx = groupStart + s;
+            cudaEventRecord(events[streamIdx], streams[streamIdx]);
+          }
+
+          for (int s = 0; s < streamsPerGroup; s++) {
+            const int streamIdx = groupStart + s;
+            cudaStreamWaitEvent(leaderStream, events[streamIdx], 0);
+          }
+
+          const int blockOffset = groupStart * numBlocksPerStream;
+          bitonicSortGlobal<<<blocksPerGroup, GLOBAL_BLOCK_SIZE, 0,
+                              leaderStream>>>(arrGpu, i, j, blockOffset);
+
+          cudaEventRecord(events[groupStart], leaderStream);
+          for (int s = 1; s < streamsPerGroup; s++) {
+            const int followerIdx = groupStart + s;
+            cudaStreamWaitEvent(streams[followerIdx], events[groupStart], 0);
+          }
         }
       } else {
         if (j >= logBlockSize) {
           for (int s = 0; s < NUM_STREAMS; s++) {
-            int blockOffset = s * numGridsPerStream;
-            bitonicSortGlobal<<<numGridsPerStream, BLOCK_SIZE, 0, streams[s]>>>(
-                arrGpu, i, j, blockOffset);
+            int blockOffset = s * numBlocksPerStream;
+            bitonicSortGlobal<<<numBlocksPerStream, GLOBAL_BLOCK_SIZE, 0,
+                                streams[s]>>>(arrGpu, i, j, blockOffset);
           }
         } else {
           for (int s = 0; s < NUM_STREAMS; s++) {
-            int blockOffset = s * numGridsPerStream;
-            bitonicSortShared<<<numGridsPerStream, BLOCK_SIZE, 0, streams[s]>>>(
-                arrGpu, i, blockOffset);
+            int blockOffset = s * numBlocksPerStream;
+            bitonicSortShared<<<numBlocksPerStream, BLOCK_SIZE, 0,
+                                streams[s]>>>(arrGpu, i, blockOffset);
           }
           goto next_stage;
         }
