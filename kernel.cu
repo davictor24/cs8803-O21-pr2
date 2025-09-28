@@ -275,7 +275,7 @@ int main(int argc, char* argv[]) {
   cudaEventCreate(&paddingCompleteEvent);
 
   DTYPE* arrGpu;
-  int N = BLOCK_SIZE;
+  int N = BLOCK_SIZE * NUM_STREAMS;
   while (N < size) {
     N <<= 1;
   }
