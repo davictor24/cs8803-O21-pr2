@@ -11,12 +11,19 @@
 // Add any additional #include headers or helper macros needed
 #include <vector>
 
+// How many streams to use for the actual sorting
 #define NUM_STREAMS 8
+
+// Block size for shared memory sorting (global memory sorting uses a fraction
+// of this)
 #define BLOCK_SIZE 1024
+
+// Maximum number of steps global memory sorting should do in one go
 #define MAX_GLOBAL_STEPS 3
 
 // Implement your GPU device kernel(s) here (e.g., the bitonic sort kernel).
 
+// Comparator for bitonic sorting
 __device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
   const DTYPE min_ = min(a, b);
   const DTYPE max_ = max(a, b);
@@ -24,9 +31,19 @@ __device__ void compareExchange(DTYPE& a, DTYPE& b, bool ascending) {
   b = ascending ? max_ : min_;
 }
 
+// Runs as many stages as possible that would fit in shared memory.
+// Instead of having an if-statement in the loop to decide which thread performs
+// the swap, the body of the loop is branchless to avoid warp divergence.
+//
+// `blockOffset` refers to the total number of blocks in previous streams.
+//
+// This (and other kernel implementations, plus `performBitonicSort`) follow the
+// algorithm in the project info document.
 __global__ void bitonicSortInitialShared(DTYPE* __restrict__ arr,
                                          int blockOffset) {
   __shared__ DTYPE shared[BLOCK_SIZE];
+  // Dummy array swapped by the thread not responsible for swapping the array
+  // elements (to maintain a branchless implementation)
   __shared__ DTYPE dummy[2];
 
   const int globalIdx = threadIdx.x + (blockIdx.x + blockOffset) * BLOCK_SIZE;
@@ -37,9 +54,11 @@ __global__ void bitonicSortInitialShared(DTYPE* __restrict__ arr,
   for (int i = 1; i <= __builtin_ctz(BLOCK_SIZE); i++) {
     for (int j = i - 1; j >= 0; j--) {
       const int partner = threadIdx.x ^ (1 << j);
+
       const bool isActive = partner > threadIdx.x;
       DTYPE& a = isActive ? shared[threadIdx.x] : dummy[0];
       DTYPE& b = isActive ? shared[partner] : dummy[1];
+
       const bool ascending = ((globalIdx & (1 << i)) == 0);
       compareExchange(a, b, ascending);
 
@@ -50,6 +69,9 @@ __global__ void bitonicSortInitialShared(DTYPE* __restrict__ arr,
   arr[globalIdx] = shared[threadIdx.x];
 }
 
+// Runs the later steps for a stage that fit into shared memory.
+// Similar to `bitonicSortInitialShared`, the body of the loop is also
+// branchless.
 __global__ void bitonicSortShared(DTYPE* __restrict__ arr, int stage,
                                   int blockOffset) {
   __shared__ DTYPE shared[BLOCK_SIZE];
@@ -62,9 +84,11 @@ __global__ void bitonicSortShared(DTYPE* __restrict__ arr, int stage,
 
   for (int j = __builtin_ctz(BLOCK_SIZE) - 1; j >= 0; j--) {
     const int partner = threadIdx.x ^ (1 << j);
+
     const bool isActive = partner > threadIdx.x;
     DTYPE& a = isActive ? shared[threadIdx.x] : dummy[0];
     DTYPE& b = isActive ? shared[partner] : dummy[1];
+
     const bool ascending = ((globalIdx & (1 << stage)) == 0);
     compareExchange(a, b, ascending);
 
@@ -74,13 +98,25 @@ __global__ void bitonicSortShared(DTYPE* __restrict__ arr, int stage,
   arr[globalIdx] = shared[threadIdx.x];
 }
 
+// Global memory sorting for steps that don't fit into shared memory.
+// `handleSteps` indicate how many steps for the given stage should be done.
 __global__ void bitonicSortGlobal(DTYPE* __restrict__ arr, int stage, int step,
                                   int blockOffset, int handleSteps) {
+  // Distance between global memory accesses
   const int stride = 1 << (step - handleSteps + 1);
-  const int groupIdx = threadIdx.x + (blockIdx.x + blockOffset) * blockDim.x;
-  const int group = groupIdx >> (step - handleSteps + 1);
-  const int offset = groupIdx & (stride - 1);
+
+  // Global identifier for thread
+  const int tid = threadIdx.x + (blockIdx.x + blockOffset) * blockDim.x;
+
+  // Bitonic sort group (block of interconnected indices)
+  const int group = tid >> (step - handleSteps + 1);
+
+  // Offset within group for thread
+  const int offset = tid & (stride - 1);
+
+  // First index within group to be handled by thread
   const int idx0 = (group << (step + 1)) + offset;
+
   const bool ascending = ((idx0 & (1 << stage)) == 0);
 
   if (handleSteps == 3) {
@@ -92,6 +128,7 @@ __global__ void bitonicSortGlobal(DTYPE* __restrict__ arr, int stage, int step,
     const int idx6 = idx5 + stride;
     const int idx7 = idx6 + stride;
 
+    // Copy once to registers
     DTYPE value0 = arr[idx0];
     DTYPE value1 = arr[idx1];
     DTYPE value2 = arr[idx2];
@@ -116,6 +153,7 @@ __global__ void bitonicSortGlobal(DTYPE* __restrict__ arr, int stage, int step,
     compareExchange(value4, value5, ascending);
     compareExchange(value6, value7, ascending);
 
+    // Copy back to global memory
     arr[idx0] = value0;
     arr[idx1] = value1;
     arr[idx2] = value2;
@@ -162,16 +200,19 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
   const int logN = __builtin_ctz(N);
   const int logBlockSize = __builtin_ctz(BLOCK_SIZE);
   const int logNumStreams = __builtin_ctz(NUM_STREAMS);
+  // log(number of elements in a stream)
   const int logStreamSize = logN - logNumStreams;
 
   const int totalNumBlocks = N / BLOCK_SIZE;
   const int numBlocksPerStream = totalNumBlocks / NUM_STREAMS;
 
+  // Events for enforcing stream dependencies
   std::vector<cudaEvent_t> events(NUM_STREAMS);
   for (int s = 0; s < NUM_STREAMS; s++) {
     cudaEventCreate(&events[s]);
   }
 
+  // Initial shared memory sorting
   for (int s = 0; s < NUM_STREAMS; s++) {
     int blockOffset = s * numBlocksPerStream;
     bitonicSortInitialShared<<<numBlocksPerStream, BLOCK_SIZE, 0, streams[s]>>>(
@@ -180,19 +221,32 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
 
   for (int stage = logBlockSize + 1; stage <= logN; stage++) {
     int step = stage - 1;
+
+    // Global memory sorting for initial steps in stage
     while (step >= logBlockSize) {
+      // Number of steps to run at the same time
       int handleSteps = std::min(MAX_GLOBAL_STEPS, step - logBlockSize + 1);
+
+      // Reduce number of threads in a block so that each thread handles
+      // 2^handleSteps elements
       int blockSize = BLOCK_SIZE >> handleSteps;
 
+      // Does this step involve blocks in different streams?
       bool crossStream = (step >= logStreamSize);
 
-      if (crossStream) {
+      if (crossStream) {  // Yes: Enforce stream dependencies
+        // How many streams in a dependent stream group
         const int streamsPerGroup = 1 << (step + 1 - logStreamSize);
+
+        // How many blocks in a dependent stream group
         const int blocksPerGroup = streamsPerGroup * numBlocksPerStream;
+
+        // How many stream groups
         const int numGroups = NUM_STREAMS / streamsPerGroup;
 
         for (int g = 0; g < numGroups; g++) {
           const int groupStart = g * streamsPerGroup;
+          // Join all streams within group to leader stream
           cudaStream_t& leaderStream = streams[groupStart];
 
           for (int s = 0; s < streamsPerGroup; s++) {
@@ -200,22 +254,26 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
             cudaEventRecord(events[streamIdx], streams[streamIdx]);
           }
 
+          // Leader waits for all streams within group
           for (int s = 0; s < streamsPerGroup; s++) {
             const int streamIdx = groupStart + s;
             cudaStreamWaitEvent(leaderStream, events[streamIdx], 0);
           }
 
+          // Run global memory sorting for the group on leader stream
           const int blockOffset = groupStart * numBlocksPerStream;
           bitonicSortGlobal<<<blocksPerGroup, blockSize, 0, leaderStream>>>(
               arrGpu, stage, step, blockOffset, handleSteps);
 
+          // All streams within group wait for leader to be done before
+          // continuing
           cudaEventRecord(events[groupStart], leaderStream);
           for (int s = 1; s < streamsPerGroup; s++) {
             const int followerIdx = groupStart + s;
             cudaStreamWaitEvent(streams[followerIdx], events[groupStart], 0);
           }
         }
-      } else {
+      } else {  // No: Run global memory sorting independently per stream
         for (int s = 0; s < NUM_STREAMS; s++) {
           int blockOffset = s * numBlocksPerStream;
           bitonicSortGlobal<<<numBlocksPerStream, blockSize, 0, streams[s]>>>(
@@ -226,6 +284,7 @@ void performBitonicSort(DTYPE* __restrict__ arrGpu,
       step -= handleSteps;
     }
 
+    // Shared memory sorting for remaining steps in stage
     for (int s = 0; s < NUM_STREAMS; s++) {
       int blockOffset = s * numBlocksPerStream;
       bitonicSortShared<<<numBlocksPerStream, BLOCK_SIZE, 0, streams[s]>>>(
@@ -269,13 +328,17 @@ int main(int argc, char* argv[]) {
     cudaStreamCreate(&streams[i]);
   }
 
+  // Input padding is done in a separate stream while input itself is being
+  // copied to device.
   cudaStream_t paddingStream;
   cudaStreamCreate(&paddingStream);
   cudaEvent_t paddingCompleteEvent;
   cudaEventCreate(&paddingCompleteEvent);
 
   DTYPE* arrGpu;
+  // All streams have at least one full block
   int N = BLOCK_SIZE * NUM_STREAMS;
+  // Round up `size` to the nearest power of 2
   while (N < size) {
     N <<= 1;
   }
@@ -283,6 +346,8 @@ int main(int argc, char* argv[]) {
 
   const int paddingLength = N - size;
   if (paddingLength > 0) {
+    // Pad with zeros for simplicity - memset cannot be used with INT_MAX.
+    // This works because all elements >= 0.
     cudaMemsetAsync(arrGpu + size, 0, paddingLength * sizeof(DTYPE),
                     paddingStream);
     cudaEventRecord(paddingCompleteEvent, paddingStream);
@@ -293,6 +358,9 @@ int main(int argc, char* argv[]) {
   int copied = 0;
   for (int i = 0; i < NUM_STREAMS && copied < size; i++) {
     const int copySize = std::min(chunkSize, size - copied);
+    // `cudaHostRegister` takes too long if done on the entire buffer at once.
+    // Register one chunk of the buffer at a time, while asynchronous work is
+    // being done on other streams
     cudaHostRegister(arrCpu + copied, copySize * sizeof(DTYPE),
                      cudaHostRegisterDefault);
     cudaMemcpyAsync(arrGpu + copied, arrCpu + copied, copySize * sizeof(DTYPE),
@@ -301,6 +369,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (paddingLength > 0) {
+    // Wait for padding to complete (if it hasn't already) before continuing.
     for (int i = NUM_STREAMS / 2; i < NUM_STREAMS; i++) {
       cudaStreamWaitEvent(streams[i], paddingCompleteEvent, 0);
     }
@@ -318,6 +387,8 @@ int main(int argc, char* argv[]) {
   // Perform bitonic sort on GPU
   performBitonicSort(arrGpu, streams, N);
 
+  // Allocate and register buffer for result while asynchronous work is being
+  // done on the GPU.
   DTYPE* arrSortedGpu = (DTYPE*)malloc(size * sizeof(DTYPE));
   cudaHostRegister(arrSortedGpu, size * sizeof(DTYPE), cudaHostRegisterDefault);
 
@@ -332,6 +403,7 @@ int main(int argc, char* argv[]) {
 
   // Transfer sorted data back to host (copied to arrSortedGpu)
   copied = 0;
+  // Since we padded with zeros, copy from the last index.
   for (int i = NUM_STREAMS - 1; i >= 0 && copied < size; i--) {
     const int copySize = std::min(chunkSize, size - copied);
     const int destOffset = size - copied - copySize;
